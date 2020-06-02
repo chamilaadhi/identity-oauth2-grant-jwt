@@ -36,16 +36,21 @@ import net.minidev.json.JSONArray;
 
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
+import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkConstants;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
 import org.wso2.carbon.identity.application.common.IdentityApplicationManagementException;
 import org.wso2.carbon.identity.application.common.model.ClaimMapping;
 import org.wso2.carbon.identity.application.common.model.FederatedAuthenticatorConfig;
 import org.wso2.carbon.identity.application.common.model.IdentityProvider;
 import org.wso2.carbon.identity.application.common.model.IdentityProviderProperty;
+import org.wso2.carbon.identity.application.common.model.PermissionsAndRoleConfig;
 import org.wso2.carbon.identity.application.common.model.Property;
+import org.wso2.carbon.identity.application.common.model.RoleMapping;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationConstants;
 import org.wso2.carbon.identity.application.common.util.IdentityApplicationManagementUtil;
 import org.wso2.carbon.identity.base.IdentityException;
@@ -64,6 +69,7 @@ import org.wso2.carbon.identity.oauth2.util.OAuth2Util;
 import org.wso2.carbon.identity.oauth2.validators.jwt.JWKSBasedJWTValidator;
 import org.wso2.carbon.idp.mgt.IdentityProviderManagementException;
 import org.wso2.carbon.idp.mgt.IdentityProviderManager;
+import org.wso2.carbon.user.core.UserCoreConstants;
 import org.wso2.carbon.utils.multitenancy.MultitenantConstants;
 
 import java.security.Key;
@@ -91,6 +97,7 @@ import static org.wso2.carbon.identity.oauth2.grant.jwt.JWTConstants.PROP_REGIST
 public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
 
     private static final String OAUTH_SPLIT_AUTHZ_USER_3_WAY = "OAuth.SplitAuthzUser3Way";
+    private static final String ROLE_CLAIM = "ROLE_CLAIM";
     private static final String DEFAULT_IDP_NAME = "default";
     private static final Log log = LogFactory.getLog(JWTBearerGrantHandler.class);
     private static final String OIDC_IDP_ENTITY_ID = "IdPEntityId";
@@ -341,6 +348,7 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
                 }
             }
             setAuthorizedUser(tokReqMsgCtx, identityProvider, subject);
+            setUserRoles(tokReqMsgCtx, identityProvider, claimsSet);
 
             if (log.isDebugEnabled()) {
                 log.debug("Subject(sub) found in JWT: " + subject);
@@ -453,6 +461,91 @@ public class JWTBearerGrantHandler extends AbstractAuthorizationGrantHandler {
             handleCustomClaims(tokReqMsgCtx, customClaims, identityProvider);
         }
         return true;
+    }
+
+    private void setUserRoles(OAuthTokenReqMessageContext tokReqMsgCtx, IdentityProvider identityProvider,
+            JWTClaimsSet claimsSet) {
+        if (OAuthServerConfiguration.getInstance().isRoleReadFromAssersionEnabled()) {
+            try {
+                String[] roles = claimsSet.getStringArrayClaim(identityProvider.getClaimConfig().getRoleClaimURI());
+                if (log.isDebugEnabled()) {
+                    log.debug("Roles defined for the claim " + identityProvider.getClaimConfig().getRoleClaimURI()
+                            + " : " + Arrays.toString(roles));
+                }
+                List<String> updatedRoles = new ArrayList<>();
+                if (roles != null) {
+                    for (String role : roles) {
+                        String updatedRoleClaimValue = getUpdatedRoleClaimValue(identityProvider, role);
+                        if (updatedRoleClaimValue != null) {
+                            updatedRoles.add(updatedRoleClaimValue);
+                        } else {
+                            updatedRoles.add(role);
+                        }
+                    }
+                }
+                AuthenticatedUser user = tokReqMsgCtx.getAuthorizedUser();
+                Map<ClaimMapping, String> userAttributes = user.getUserAttributes();
+                if (log.isDebugEnabled()) {
+                    log.debug("Mapped roles to claim " + FrameworkConstants.LOCAL_ROLE_CLAIM_URI + " : "
+                            + updatedRoles.toString());
+                }
+                userAttributes.put(
+                        ClaimMapping.build(FrameworkConstants.LOCAL_ROLE_CLAIM_URI,
+                                FrameworkConstants.LOCAL_ROLE_CLAIM_URI, null, false),
+                        updatedRoles.toString().replace(" ", ""));
+                user.setUserAttributes(userAttributes);
+                tokReqMsgCtx.setAuthorizedUser(user);
+            } catch (ParseException e) {
+                log.error("Couldn't retrieve roles:", e);
+            }
+        }
+    }
+    
+    /**
+     * Check the retireved roles against the role mappings in the IDP and return the updated roles
+     * @param identityProvider used to retrieve the role mappings
+     * @param currentRoleClaimValue current roles received through the token
+     * @return updated roles
+     */
+    private String getUpdatedRoleClaimValue(IdentityProvider identityProvider, String currentRoleClaimValue) {
+
+        if (StringUtils.equalsIgnoreCase(IdentityApplicationConstants.RESIDENT_IDP_RESERVED_NAME,
+                identityProvider.getIdentityProviderName())) {
+            return currentRoleClaimValue;
+        }
+        currentRoleClaimValue = currentRoleClaimValue.replace("\\/", "/").
+                replace("[", "").replace("]", "").replace("\"", "");
+
+        PermissionsAndRoleConfig permissionAndRoleConfig = identityProvider.getPermissionAndRoleConfig();
+        if (permissionAndRoleConfig != null && ArrayUtils.isNotEmpty(permissionAndRoleConfig.getRoleMappings())) {
+            String[] receivedRoles = currentRoleClaimValue.split(FrameworkUtils.getMultiAttributeSeparator());
+            List<String> updatedRoleClaimValues = new ArrayList<>();
+            String updatedLocalRole;
+            loop:
+            for (String receivedRole : receivedRoles) {
+                for (RoleMapping roleMapping : permissionAndRoleConfig.getRoleMappings()) {
+                    if (roleMapping.getRemoteRole().equals(receivedRole)) {
+                        updatedLocalRole = StringUtils.isEmpty(roleMapping.getLocalRole().getUserStoreId())
+                                ? roleMapping.getLocalRole().getLocalRoleName()
+                                : roleMapping.getLocalRole().getUserStoreId() + UserCoreConstants.DOMAIN_SEPARATOR
+                                        + roleMapping.getLocalRole().getLocalRoleName();
+                        updatedRoleClaimValues.add(updatedLocalRole);
+                        continue loop;
+                    }
+                }
+                if (!OAuthServerConfiguration.getInstance().isReturnOnlyMappedLocalRoles()) {
+                    updatedRoleClaimValues.add(receivedRole);
+                }
+            }
+            if (!updatedRoleClaimValues.isEmpty()) {
+                return StringUtils.join(updatedRoleClaimValues, FrameworkUtils.getMultiAttributeSeparator());
+            }
+            return null;
+        }
+        if (!OAuthServerConfiguration.getInstance().isReturnOnlyMappedLocalRoles()) {
+            return currentRoleClaimValue;
+        }
+        return null;
     }
 
     /**
